@@ -1,13 +1,20 @@
 import json
 import sqlite3
+import struct
 from contextlib import closing
 from datetime import datetime
+from math import sqrt
 from pathlib import Path
 from typing import Any, Optional
 
+import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+
+OLLAMA_URL = "http://localhost:11434/api/embeddings"
+EMBED_MODEL = "nomic-embed-text"
+EMBED_DIM = 768
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "prompts.db"
@@ -22,6 +29,34 @@ def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def embed_text(text: str) -> list[float] | None:
+    """Get embedding from Ollama. Returns None if Ollama is unavailable."""
+    try:
+        resp = httpx.post(OLLAMA_URL, json={"model": EMBED_MODEL, "prompt": text}, timeout=10.0)
+        resp.raise_for_status()
+        return resp.json().get("embedding")
+    except Exception:
+        return None
+
+
+def pack_embedding(emb: list[float]) -> bytes:
+    return struct.pack(f"{len(emb)}f", *emb)
+
+
+def unpack_embedding(data: bytes) -> list[float]:
+    n = len(data) // 4
+    return list(struct.unpack(f"{n}f", data))
+
+
+def cosine_similarity(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    na = sqrt(sum(x * x for x in a))
+    nb = sqrt(sum(x * x for x in b))
+    if na == 0 or nb == 0:
+        return 0.0
+    return dot / (na * nb)
 
 
 def init_db() -> None:
@@ -40,6 +75,17 @@ def init_db() -> None:
                 is_deleted INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS prompt_embeddings (
+                prompt_id INTEGER PRIMARY KEY,
+                embedding BLOB NOT NULL,
+                content_hash TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(prompt_id) REFERENCES prompts(id)
             )
             """
         )
@@ -299,6 +345,8 @@ def create_prompt(payload: PromptCreate) -> dict[str, Any]:
             (prompt_id, payload.content, payload.change_note, now),
         )
         conn.commit()
+    # Embed in background (non-blocking if Ollama is down)
+    _embed_prompt(prompt_id, payload.content, payload.name, ", ".join(payload.tags), payload.category)
     return get_prompt(prompt_id)
 
 
@@ -331,6 +379,8 @@ def update_prompt(prompt_id: int, payload: PromptUpdate) -> dict[str, Any]:
             (prompt_id, next_version, content, payload.change_note, now),
         )
         conn.commit()
+    # Re-embed on content change
+    _embed_prompt(prompt_id, content, row["name"], tags if isinstance(tags, str) else ", ".join(payload.tags or []), category)
     return get_prompt(prompt_id)
 
 
@@ -352,3 +402,79 @@ def list_categories() -> dict[str, Any]:
             "SELECT category, COUNT(*) as count FROM prompts WHERE is_deleted = 0 GROUP BY category ORDER BY category"
         ).fetchall()
     return {"categories": [dict(r) for r in rows]}
+
+
+def _embed_prompt(prompt_id: int, content: str, name: str, tags: str, category: str) -> None:
+    """Generate and store embedding for a prompt. Runs in background, non-blocking."""
+    import hashlib
+    text = f"{name} ({category}): {tags}\n\n{content}"
+    content_hash = hashlib.md5(text.encode()).hexdigest()
+    emb = embed_text(text)
+    if emb is None:
+        return
+    blob = pack_embedding(emb)
+    now = utc_now()
+    with closing(get_conn()) as conn:
+        conn.execute(
+            """
+            INSERT INTO prompt_embeddings (prompt_id, embedding, content_hash, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(prompt_id) DO UPDATE SET embedding=excluded.embedding, content_hash=excluded.content_hash, updated_at=excluded.updated_at
+            """,
+            (prompt_id, blob, content_hash, now),
+        )
+        conn.commit()
+
+
+class SemanticSearchRequest(BaseModel):
+    query: str = Field(min_length=1)
+    limit: int = Field(default=5, ge=1, le=20)
+    min_score: float = Field(default=0.3, ge=0.0, le=1.0)
+
+
+@app.post("/api/prompts/search/semantic")
+def semantic_search(payload: SemanticSearchRequest) -> dict[str, Any]:
+    """Search prompts by semantic similarity using GPU-accelerated embeddings."""
+    query_emb = embed_text(payload.query)
+    if query_emb is None:
+        raise HTTPException(status_code=503, detail="Embedding service unavailable (Ollama not running?)")
+
+    with closing(get_conn()) as conn:
+        # Get all embeddings
+        emb_rows = conn.execute("SELECT prompt_id, embedding FROM prompt_embeddings").fetchall()
+        # Get all active prompts for lookup
+        prompt_rows = conn.execute("SELECT * FROM prompts WHERE is_deleted = 0").fetchall()
+        prompt_map = {r["id"]: r for r in prompt_rows}
+
+    results = []
+    for row in emb_rows:
+        pid = row["prompt_id"]
+        if pid not in prompt_map:
+            continue
+        stored_emb = unpack_embedding(row["embedding"])
+        score = cosine_similarity(query_emb, stored_emb)
+        if score >= payload.min_score:
+            prompt = row_to_prompt(prompt_map[pid])
+            prompt["score"] = round(score, 4)
+            results.append(prompt)
+
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return {"results": results[: payload.limit], "total": len(results)}
+
+
+@app.post("/api/prompts/embeddings/rebuild")
+def rebuild_embeddings() -> dict[str, Any]:
+    """Rebuild all prompt embeddings. Useful after first setup or model change."""
+    with closing(get_conn()) as conn:
+        rows = conn.execute("SELECT * FROM prompts WHERE is_deleted = 0").fetchall()
+
+    embedded = 0
+    failed = 0
+    for row in rows:
+        try:
+            _embed_prompt(row["id"], row["content"], row["name"], row["tags"], row["category"])
+            embedded += 1
+        except Exception:
+            failed += 1
+
+    return {"embedded": embedded, "failed": failed, "total": len(rows)}
