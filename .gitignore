@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.env
+__pycache__/
+*.pyc
+
+# Real prompt database (contains private prompts)
+backend/prompts.db
+backend/prompts.db-journal
+backend/prompts.db-wal
