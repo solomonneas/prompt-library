@@ -8,3 +8,9 @@ __pycache__/
 backend/prompts.db
 backend/prompts.db-journal
 backend/prompts.db-wal
+CLAUDE.md
+TASK_*.md
+IMPLEMENTATION_*.md
+*_SUMMARY.md
+POLISH_NOTES.md
+FRONTEND_DESIGN.md
