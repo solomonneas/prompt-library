@@ -1,13 +1,23 @@
-# Prompt Library
+<p align="center">
+  <img src="docs/assets/prompt-library-banner.jpg" alt="Prompt Library banner">
+</p>
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-blue)](https://www.python.org/downloads/)
-[![TypeScript](https://img.shields.io/badge/TypeScript-5.0%2B-blue)](https://www.typescriptlang.org/)
-[![React 18+](https://img.shields.io/badge/React-18%2B-61dafb)](https://react.dev/)
+<h1 align="center">Prompt Library</h1>
+
+<p align="center">
+  <strong>Your source of truth for prompt management, versioning, search, and reuse.</strong>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.9%2B-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.9+">
+  <img src="https://img.shields.io/badge/FastAPI-0.115-009688?style=for-the-badge&logo=fastapi&logoColor=white" alt="FastAPI 0.115">
+  <img src="https://img.shields.io/badge/TypeScript-5.7-3178C6?style=for-the-badge&logo=typescript&logoColor=white" alt="TypeScript 5.7">
+  <img src="https://img.shields.io/badge/React-18-61DAFB?style=for-the-badge&logo=react&logoColor=0f172a" alt="React 18">
+  <img src="https://img.shields.io/badge/SQLite-prompt_store-003B57?style=for-the-badge&logo=sqlite&logoColor=white" alt="SQLite prompt store">
+  <img src="https://img.shields.io/badge/license-MIT-green?style=for-the-badge" alt="MIT license">
+</p>
 
 Your source of truth for prompt management. Browse, version, and share prompts with built-in variable substitution, instant copy-to-clipboard, and full search capabilities.
-
-> [Screenshot placeholder: expandable prompt cards with copy buttons, search bar, theme selector]
 
 ## Quick Start
 
