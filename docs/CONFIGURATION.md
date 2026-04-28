@@ -16,10 +16,17 @@ DEBUG=false
 DATABASE_URL=sqlite:///./prompts.db
 
 # CORS (allow frontend to call API)
-CORS_ORIGINS=http://localhost:5201,http://localhost:3000
+CORS_ORIGINS=http://localhost:5201,http://localhost:5173,http://localhost:8005
 
-# Seed on startup
-AUTO_SEED=true
+# Optional source Markdown file to import on startup
+SEED_PATH=
+
+# Optional API key for mutating routes
+PROMPT_LIBRARY_API_KEY=
+
+# Embeddings
+OLLAMA_EMBEDDINGS_URL=http://localhost:11434/api/embeddings
+PROMPT_EMBED_MODEL=qwen3-embedding:8b
 ```
 
 #### Variable Details
@@ -30,8 +37,11 @@ AUTO_SEED=true
 | `PORT` | `5202` | Backend API port |
 | `DEBUG` | `false` | Enable debug logging and hot-reload |
 | `DATABASE_URL` | `sqlite:///./prompts.db` | SQLite connection string |
-| `CORS_ORIGINS` | `http://localhost:5201` | Comma-separated allowed origins for frontend |
-| `AUTO_SEED` | `true` | Auto-generate 8 demo prompts on first run |
+| `CORS_ORIGINS` | `http://localhost:5173,http://localhost:8005,http://localhost:5201` | Comma-separated allowed origins |
+| `SEED_PATH` | unset | Optional Markdown file imported as `variant-design-rules` on first startup |
+| `PROMPT_LIBRARY_API_KEY` | unset | If set, required on mutating routes as `X-API-Key` header or `token` query param |
+| `OLLAMA_EMBEDDINGS_URL` | `http://localhost:11434/api/embeddings` | Ollama-compatible embeddings endpoint |
+| `PROMPT_EMBED_MODEL` | `qwen3-embedding:8b` | Embedding model sent to Ollama |
 
 ### Frontend (React + Vite)
 
@@ -73,11 +83,11 @@ To change ports:
 
 ### Fresh Install (Demo Data)
 
-On first run, the backend auto-seeds 8 generic prompts if `AUTO_SEED=true`:
+To seed 8 generic prompts into a fresh database:
 
 ```bash
 cd backend
-python backend/seed_demo.py
+python seed_demo.py
 ```
 
 Database file created at `backend/prompts.db` (gitignored).
@@ -94,7 +104,8 @@ cd backend
 rm prompts.db
 
 # Restart backend (will auto-seed)
-python -m uvicorn main:app --reload
+python seed_demo.py
+python -m uvicorn app:app --reload --host 0.0.0.0 --port 5202
 ```
 
 ### Use Real Data
@@ -103,15 +114,16 @@ If using production data from another source:
 
 1. Stop the backend
 2. Copy your `prompts.db` to `backend/prompts.db`
-3. Set `AUTO_SEED=false` in `.env` to prevent overwriting
+3. Keep `SEED_PATH` unset unless you intentionally want to import a Markdown seed file
 4. Restart backend
 
 ### Database Schema
 
-Prompt Library creates two tables automatically on first run:
+Prompt Library creates three tables automatically on first run:
 
 - `prompts` - Main prompt records
 - `prompt_versions` - Immutable version history
+- `prompt_embeddings` - Packed embedding vectors for semantic search
 
 See [ARCHITECTURE.md](ARCHITECTURE.md#database-schema) for full schema details.
 
@@ -122,7 +134,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md#database-schema) for full schema details.
 ```bash
 cd backend
 pip install -r requirements.txt
-python -m uvicorn main:app --host 0.0.0.0 --port 5202 --workers 4
+python -m uvicorn app:app --host 0.0.0.0 --port 5202 --workers 4
 ```
 
 ### Frontend
@@ -142,7 +154,8 @@ Set these in `.env`:
 ```bash
 DEBUG=false
 CORS_ORIGINS=https://yourdomain.com,https://www.yourdomain.com
-AUTO_SEED=false
+PROMPT_LIBRARY_API_KEY=generate-a-long-random-value
+PROMPT_EMBED_MODEL=qwen3-embedding:8b
 ```
 
 **Frontend:**

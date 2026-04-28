@@ -11,7 +11,7 @@ Prompt Library is a full-stack application split into independent frontend and b
 │                     │         │                      │
 │ - UI Components     │         │ - REST API           │
 │ - Search/Filter     │         │ - Version History    │
-│ - Themes            │         │ - Variable Subst.    │
+│ - Themes            │         │ - Semantic Search    │
 │ - Copy-to-Clipboard │         │ - SQLite DB          │
 └─────────────────────┘         └──────────────────────┘
 ```
@@ -48,53 +48,68 @@ Prompt Library is a full-stack application split into independent frontend and b
 | `DELETE` | `/api/prompts/{id}` | Soft delete prompt |
 | `GET` | `/api/prompts/{id}/versions` | List all versions of a prompt |
 | `GET` | `/api/prompts/{id}/versions/{version_num}` | Get specific version |
-| `POST` | `/api/prompts/{id}/restore` | Restore from previous version |
+| `POST` | `/api/prompts/{id}/restore/{version_num}` | Restore from previous version |
+| `GET` | `/api/prompts/by-name/{name}` | Fetch a prompt by stable slug |
+| `GET` | `/api/categories` | List categories and counts |
+| `GET` | `/api/health` | Health, embedding model, and prompt counts |
+| `POST` | `/api/prompts/search/semantic` | Semantic prompt search through Ollama embeddings |
+| `POST` | `/api/prompts/embeddings/rebuild` | Rebuild stored prompt embeddings |
 
 ### Database Schema
 
 #### `prompts` Table
 ```sql
 CREATE TABLE prompts (
-  id TEXT PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT UNIQUE NOT NULL,
   title TEXT NOT NULL,
+  category TEXT NOT NULL,
+  tags TEXT NOT NULL DEFAULT '',
   content TEXT NOT NULL,
-  category TEXT,
-  tags TEXT,  -- JSON array stored as string
-  created_at TIMESTAMP,
-  updated_at TIMESTAMP,
-  current_version INTEGER DEFAULT 1,
-  deleted BOOLEAN DEFAULT 0
+  variables TEXT NOT NULL DEFAULT '[]',
+  current_version INTEGER NOT NULL DEFAULT 1,
+  is_deleted INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
 );
 ```
 
 #### `prompt_versions` Table
 ```sql
 CREATE TABLE prompt_versions (
-  id TEXT PRIMARY KEY,
-  prompt_id TEXT NOT NULL FOREIGN KEY,
-  version_number INTEGER NOT NULL,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  prompt_id INTEGER NOT NULL,
+  version INTEGER NOT NULL,
   content TEXT NOT NULL,
-  changed_at TIMESTAMP,
-  UNIQUE(prompt_id, version_number)
+  change_note TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(prompt_id) REFERENCES prompts(id),
+  UNIQUE(prompt_id, version)
+);
+```
+
+#### `prompt_embeddings` Table
+```sql
+CREATE TABLE prompt_embeddings (
+  prompt_id INTEGER PRIMARY KEY,
+  embedding BLOB NOT NULL,
+  content_hash TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(prompt_id) REFERENCES prompts(id)
 );
 ```
 
 ### Variable Substitution
 
-Prompts can contain variables in the format `{{variable_name}}`. The backend provides a substitution endpoint:
+Prompts can contain variables in the format `{{variable_name}}`. Variables are stored on each prompt as a JSON array and rendered in the frontend for live preview and copy workflows.
 
-```
-POST /api/prompts/substitute
-{
-  "prompt_id": "uuid",
-  "variables": {
-    "variable_name": "value",
-    "another_var": "another_value"
-  }
-}
-```
+### Write Protection
 
-Frontend renders live preview as user types variable values.
+If `PROMPT_LIBRARY_API_KEY` is set, mutating routes require the key through the `X-API-Key` header or `token` query parameter. Read routes remain public by default for local dashboard and agent access.
+
+### Semantic Search
+
+Semantic search uses an Ollama-compatible embeddings endpoint. The default model is `qwen3-embedding:8b`, configurable with `PROMPT_EMBED_MODEL`.
 
 ## Theme System
 
@@ -137,5 +152,5 @@ Frontend Update + UI Render
 
 - Frontend and backend run independently - can be deployed separately
 - Database file gitignored; seed script generates fresh prompts on startup
-- API CORS enabled for frontend (configurable in `backend/main.py`)
-- No auth/permissions layer (internal use, add as needed)
+- API CORS enabled for configured origins
+- Optional API key protection for mutating routes
