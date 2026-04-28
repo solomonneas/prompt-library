@@ -1,4 +1,7 @@
+import asyncio
 import json
+import logging
+import os
 import sqlite3
 import struct
 from contextlib import closing
@@ -8,17 +11,27 @@ from pathlib import Path
 from typing import Any, Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-OLLAMA_URL = "http://localhost:11434/api/embeddings"
-EMBED_MODEL = "nomic-embed-text"
-EMBED_DIM = 768
+OLLAMA_URL = os.environ.get("OLLAMA_EMBEDDINGS_URL", "http://localhost:11434/api/embeddings")
+EMBED_MODEL = os.environ.get("PROMPT_EMBED_MODEL", "qwen3-embedding:8b")
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get(
+        "CORS_ORIGINS",
+        "http://localhost:5173,http://localhost:8005,http://localhost:5201",
+    ).split(",")
+    if origin.strip()
+]
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "prompts.db"
-SEED_PATH = Path("/home/clawdbot/.openclaw/workspace/variant-gallery/PROMPT_RULES.md")
+SEED_PATH_RAW = os.environ.get("SEED_PATH")
+SEED_PATH = Path(SEED_PATH_RAW) if SEED_PATH_RAW else None
+
+logger = logging.getLogger(__name__)
 
 
 def utc_now() -> str:
@@ -31,10 +44,11 @@ def get_conn() -> sqlite3.Connection:
     return conn
 
 
-def embed_text(text: str) -> list[float] | None:
-    """Get embedding from Ollama. Returns None if Ollama is unavailable."""
+async def embed_text(text: str) -> list[float] | None:
+    """Get an embedding from Ollama asynchronously. Returns None if unavailable."""
     try:
-        resp = httpx.post(OLLAMA_URL, json={"model": EMBED_MODEL, "prompt": text}, timeout=10.0)
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(OLLAMA_URL, json={"model": EMBED_MODEL, "prompt": text})
         resp.raise_for_status()
         return resp.json().get("embedding")
     except Exception:
@@ -134,6 +148,8 @@ def row_to_prompt(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def seed_prompt_rules() -> None:
+    if SEED_PATH is None:
+        return
     if not SEED_PATH.exists():
         return
     content = SEED_PATH.read_text(encoding="utf-8")
@@ -175,9 +191,9 @@ class PromptCreate(BaseModel):
     name: str = Field(min_length=1)
     title: str = Field(min_length=1)
     category: str
-    tags: list[str] = []
+    tags: list[str] = Field(default_factory=list)
     content: str
-    variables: list[dict[str, Any] | str] = []
+    variables: list[dict[str, Any] | str] = Field(default_factory=list)
     change_note: str = "Initial version"
 
 
@@ -193,22 +209,48 @@ class PromptUpdate(BaseModel):
 app = FastAPI(title="Prompt Library API", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+async def require_api_key(
+    token: Optional[str] = Query(default=None),
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+) -> None:
+    configured_key = getattr(app.state, "api_key", None)
+    if not configured_key:
+        return
+
+    supplied_key = x_api_key or token
+    if supplied_key != configured_key:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
 @app.on_event("startup")
 def startup() -> None:
     init_db()
     seed_prompt_rules()
+    app.state.api_key = os.environ.get("PROMPT_LIBRARY_API_KEY")
+    if app.state.api_key:
+        logger.info("Prompt Library API key authentication enabled")
+    else:
+        logger.warning("PROMPT_LIBRARY_API_KEY not set. Mutating routes are running without authentication.")
 
 
 @app.get("/api/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
+def health() -> dict[str, int | str]:
+    conn = get_conn()
+    total_prompts = conn.execute("SELECT COUNT(*) AS total FROM prompts").fetchone()["total"]
+    embedded_prompts = conn.execute("SELECT COUNT(*) AS total FROM prompt_embeddings").fetchone()["total"]
+    conn.close()
+    return {
+        "status": "ok",
+        "embedding_model": EMBED_MODEL,
+        "total_prompts": int(total_prompts or 0),
+        "embedded_prompts": int(embedded_prompts or 0),
+    }
 
 
 @app.get("/api/prompts")
@@ -262,7 +304,9 @@ def get_prompt_by_name(name: str) -> dict[str, Any]:
 @app.get("/api/prompts/{prompt_id}/versions")
 def get_versions(prompt_id: int) -> dict[str, Any]:
     with closing(get_conn()) as conn:
-        prompt = conn.execute("SELECT id FROM prompts WHERE id = ?", (prompt_id,)).fetchone()
+        prompt = conn.execute(
+            "SELECT id FROM prompts WHERE id = ? AND is_deleted = 0", (prompt_id,)
+        ).fetchone()
         if not prompt:
             raise HTTPException(status_code=404, detail="Prompt not found")
         rows = conn.execute(
@@ -276,7 +320,12 @@ def get_versions(prompt_id: int) -> dict[str, Any]:
 def get_specific_version(prompt_id: int, version: int) -> dict[str, Any]:
     with closing(get_conn()) as conn:
         row = conn.execute(
-            "SELECT id, prompt_id, version, content, change_note, created_at FROM prompt_versions WHERE prompt_id = ? AND version = ?",
+            """
+            SELECT pv.id, pv.prompt_id, pv.version, pv.content, pv.change_note, pv.created_at
+            FROM prompt_versions pv
+            JOIN prompts p ON p.id = pv.prompt_id
+            WHERE pv.prompt_id = ? AND pv.version = ? AND p.is_deleted = 0
+            """,
             (prompt_id, version),
         ).fetchone()
         if not row:
@@ -284,29 +333,26 @@ def get_specific_version(prompt_id: int, version: int) -> dict[str, Any]:
     return dict(row)
 
 
-@app.post("/api/prompts/{prompt_id}/restore/{version}")
-def restore_version(prompt_id: int, version: int) -> dict[str, Any]:
+@app.post("/api/prompts/{prompt_id}/restore/{version}", dependencies=[Depends(require_api_key)])
+async def restore_version(prompt_id: int, version: int) -> dict[str, Any]:
     with closing(get_conn()) as conn:
-        # Get the prompt
         prompt_row = conn.execute(
             "SELECT * FROM prompts WHERE id = ? AND is_deleted = 0", (prompt_id,)
         ).fetchone()
         if not prompt_row:
             raise HTTPException(status_code=404, detail="Prompt not found")
-        
-        # Get the version to restore
+
         version_row = conn.execute(
             "SELECT content FROM prompt_versions WHERE prompt_id = ? AND version = ?",
             (prompt_id, version),
         ).fetchone()
         if not version_row:
             raise HTTPException(status_code=404, detail="Version not found")
-        
-        # Create new version with restored content
+
         next_version = int(prompt_row["current_version"]) + 1
         now = utc_now()
         restored_content = version_row["content"]
-        
+
         conn.execute(
             """
             UPDATE prompts
@@ -320,11 +366,21 @@ def restore_version(prompt_id: int, version: int) -> dict[str, Any]:
             (prompt_id, next_version, restored_content, f"Restored from version {version}", now),
         )
         conn.commit()
+
+    asyncio.create_task(
+        _embed_prompt(
+            prompt_id,
+            restored_content,
+            prompt_row["name"],
+            prompt_row["tags"],
+            prompt_row["category"],
+        )
+    )
     return get_prompt(prompt_id)
 
 
-@app.post("/api/prompts")
-def create_prompt(payload: PromptCreate) -> dict[str, Any]:
+@app.post("/api/prompts", dependencies=[Depends(require_api_key)])
+async def create_prompt(payload: PromptCreate) -> dict[str, Any]:
     now = utc_now()
     tags = ", ".join(payload.tags)
     vars_json = json.dumps(payload.variables)
@@ -345,13 +401,15 @@ def create_prompt(payload: PromptCreate) -> dict[str, Any]:
             (prompt_id, payload.content, payload.change_note, now),
         )
         conn.commit()
-    # Embed in background (non-blocking if Ollama is down)
-    _embed_prompt(prompt_id, payload.content, payload.name, ", ".join(payload.tags), payload.category)
+
+    asyncio.create_task(
+        _embed_prompt(prompt_id, payload.content, payload.name, tags, payload.category)
+    )
     return get_prompt(prompt_id)
 
 
-@app.put("/api/prompts/{prompt_id}")
-def update_prompt(prompt_id: int, payload: PromptUpdate) -> dict[str, Any]:
+@app.put("/api/prompts/{prompt_id}", dependencies=[Depends(require_api_key)])
+async def update_prompt(prompt_id: int, payload: PromptUpdate) -> dict[str, Any]:
     with closing(get_conn()) as conn:
         row = conn.execute("SELECT * FROM prompts WHERE id = ? AND is_deleted = 0", (prompt_id,)).fetchone()
         if not row:
@@ -379,12 +437,12 @@ def update_prompt(prompt_id: int, payload: PromptUpdate) -> dict[str, Any]:
             (prompt_id, next_version, content, payload.change_note, now),
         )
         conn.commit()
-    # Re-embed on content change
-    _embed_prompt(prompt_id, content, row["name"], tags if isinstance(tags, str) else ", ".join(payload.tags or []), category)
+
+    asyncio.create_task(_embed_prompt(prompt_id, content, row["name"], tags, category))
     return get_prompt(prompt_id)
 
 
-@app.delete("/api/prompts/{prompt_id}")
+@app.delete("/api/prompts/{prompt_id}", dependencies=[Depends(require_api_key)])
 def delete_prompt(prompt_id: int) -> dict[str, bool]:
     with closing(get_conn()) as conn:
         row = conn.execute("SELECT id FROM prompts WHERE id = ? AND is_deleted = 0", (prompt_id,)).fetchone()
@@ -404,14 +462,15 @@ def list_categories() -> dict[str, Any]:
     return {"categories": [dict(r) for r in rows]}
 
 
-def _embed_prompt(prompt_id: int, content: str, name: str, tags: str, category: str) -> None:
-    """Generate and store embedding for a prompt. Runs in background, non-blocking."""
+async def _embed_prompt(prompt_id: int, content: str, name: str, tags: str, category: str) -> bool:
+    """Generate and store an embedding for a prompt asynchronously."""
     import hashlib
+
     text = f"{name} ({category}): {tags}\n\n{content}"
     content_hash = hashlib.md5(text.encode()).hexdigest()
-    emb = embed_text(text)
+    emb = await embed_text(text)
     if emb is None:
-        return
+        return False
     blob = pack_embedding(emb)
     now = utc_now()
     with closing(get_conn()) as conn:
@@ -424,6 +483,7 @@ def _embed_prompt(prompt_id: int, content: str, name: str, tags: str, category: 
             (prompt_id, blob, content_hash, now),
         )
         conn.commit()
+    return True
 
 
 class SemanticSearchRequest(BaseModel):
@@ -433,16 +493,14 @@ class SemanticSearchRequest(BaseModel):
 
 
 @app.post("/api/prompts/search/semantic")
-def semantic_search(payload: SemanticSearchRequest) -> dict[str, Any]:
-    """Search prompts by semantic similarity using GPU-accelerated embeddings."""
-    query_emb = embed_text(payload.query)
+async def semantic_search(payload: SemanticSearchRequest) -> dict[str, Any]:
+    """Search prompts by semantic similarity using asynchronously fetched embeddings."""
+    query_emb = await embed_text(payload.query)
     if query_emb is None:
         raise HTTPException(status_code=503, detail="Embedding service unavailable (Ollama not running?)")
 
     with closing(get_conn()) as conn:
-        # Get all embeddings
         emb_rows = conn.execute("SELECT prompt_id, embedding FROM prompt_embeddings").fetchall()
-        # Get all active prompts for lookup
         prompt_rows = conn.execute("SELECT * FROM prompts WHERE is_deleted = 0").fetchall()
         prompt_map = {r["id"]: r for r in prompt_rows}
 
@@ -462,9 +520,9 @@ def semantic_search(payload: SemanticSearchRequest) -> dict[str, Any]:
     return {"results": results[: payload.limit], "total": len(results)}
 
 
-@app.post("/api/prompts/embeddings/rebuild")
-def rebuild_embeddings() -> dict[str, Any]:
-    """Rebuild all prompt embeddings. Useful after first setup or model change."""
+@app.post("/api/prompts/embeddings/rebuild", dependencies=[Depends(require_api_key)])
+async def rebuild_embeddings() -> dict[str, Any]:
+    """Rebuild all prompt embeddings and report only successful writes as embedded."""
     with closing(get_conn()) as conn:
         rows = conn.execute("SELECT * FROM prompts WHERE is_deleted = 0").fetchall()
 
@@ -472,9 +530,14 @@ def rebuild_embeddings() -> dict[str, Any]:
     failed = 0
     for row in rows:
         try:
-            _embed_prompt(row["id"], row["content"], row["name"], row["tags"], row["category"])
-            embedded += 1
+            success = await _embed_prompt(row["id"], row["content"], row["name"], row["tags"], row["category"])
+            if success:
+                embedded += 1
+            else:
+                failed += 1
+                logger.warning("Failed to rebuild embedding for prompt_id=%s", row["id"])
         except Exception:
             failed += 1
+            logger.exception("Error rebuilding embedding for prompt_id=%s", row["id"])
 
     return {"embedded": embedded, "failed": failed, "total": len(rows)}
