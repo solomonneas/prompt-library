@@ -19,6 +19,7 @@ cd prompt-library
 # Backend setup
 cd backend
 pip install -r requirements.txt
+uvicorn app:app --reload --host 0.0.0.0 --port 5202
 cd ..
 
 # Frontend setup
@@ -36,8 +37,10 @@ Frontend runs on `http://localhost:5201` | Backend API on `http://localhost:5202
 - **Version Control** - Immutable history on every edit, view or restore any version
 - **Variable Substitution** - Use `{{variables}}` in prompts with live preview
 - **Smart Filtering** - Categories, tags, and full-text search
+- **Semantic Search** - Optional Ollama embeddings with `qwen3-embedding:8b` by default
 - **5 Visual Themes** - Editorial, Warm Earthy, Clean Light, Ledger, Dark Pro
 - **REST API** - Programmatic access for sub-agents and integrations
+- **Write Protection** - Optional API key requirement for create, update, delete, restore, and embedding rebuild routes
 - **Demo Data** - 8 seed prompts for fresh installs, real database gitignored
 
 ## Documentation
@@ -51,7 +54,8 @@ Frontend runs on `http://localhost:5201` | Backend API on `http://localhost:5202
 
 - **Frontend:** React 18 + TypeScript + Vite
 - **Backend:** FastAPI + SQLite + Pydantic
-- **Storage:** SQLite (prompts + versions, gitignored)
+- **Embeddings:** Ollama-compatible embeddings API
+- **Storage:** SQLite (prompts, versions, and embeddings, gitignored)
 
 ## License
 
