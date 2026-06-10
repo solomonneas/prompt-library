@@ -1,0 +1,15 @@
+#!/bin/bash
+# Single verification entrypoint. AGENTS.md defers to this file, so the
+# gate lives in exactly one place. Runs entirely offline against this
+# checkout; it never touches the live local service.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+# Backend gate: syntax check. No backend test suite exists yet, so this
+# is the smallest real check that catches broken Python before commit.
+python3 -m py_compile backend/app.py backend/seed_demo.py
+
+# Frontend gate: TypeScript type check + production build (tsc -b && vite build).
+cd frontend
+[ -d node_modules ] || npm install
+npm run build
